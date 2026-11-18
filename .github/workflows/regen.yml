@@ -42,7 +42,8 @@ env:
 jobs:
   sdk:
     name: ${{ matrix.lang }} / ${{ matrix.api }}
-    runs-on: ${{ matrix.lang == 'swift' && 'macos-latest' || 'ubuntu-latest' }}
+    # Swift needs Apple frameworks; hex.pm has no OTP 25 build for ubuntu 26.04.
+    runs-on: ${{ matrix.lang == 'swift' && 'macos-latest' || matrix.lang == 'elixir' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -124,7 +125,10 @@ jobs:
       - name: compile check
         run: bash ci/check.sh ${{ matrix.lang }} sdks/${{ matrix.lang }}/${{ matrix.api }}
 
-      - uses: actions/upload-artifact@v4
+      # Uploaded even when the check fails, so a broken client can be inspected.
+      # Safe: publish needs EVERY leg green, so a failed leg's tree never ships.
+      - if: always() && hashFiles(format('sdk-{0}-{1}.tgz', matrix.lang, matrix.api)) != ''
+        uses: actions/upload-artifact@v4
         with:
           name: sdk-${{ matrix.lang }}-${{ matrix.api }}
           path: sdk-${{ matrix.lang }}-${{ matrix.api }}.tgz
@@ -175,20 +179,30 @@ jobs:
 
       - name: push to crossly-dev/crossly-${{ matrix.lang }}
         env:
+          # Either one fine-grained PAT (Contents: read and write on the 12 mirrors)…
+          PUSH_TOKEN: ${{ secrets.MIRROR_PUSH_TOKEN }}
+          # …or a per-mirror deploy key with write access (needs deploy keys enabled for the org).
           DEPLOY_KEY: ${{ secrets[format('MIRROR_KEY_{0}', matrix.key)] }}
           TAG: ${{ inputs.tag }}
           REPO: crossly-dev/crossly-${{ matrix.lang }}
           LANG_ID: ${{ matrix.lang }}
         run: |
-          if [ -z "$DEPLOY_KEY" ]; then
-            echo "::error::secret MIRROR_KEY_${{ matrix.key }} is not set (deploy key with write access to $REPO)"
+          if [ -n "$PUSH_TOKEN" ]; then
+            remote="https://github.com/$REPO.git"
+            auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+            echo "::add-mask::$auth"
+            git config --global "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
+          elif [ -n "$DEPLOY_KEY" ]; then
+            remote="git@github.com:$REPO.git"
+            install -m 700 -d ~/.ssh
+            printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror_key
+            chmod 600 ~/.ssh/mirror_key
+            ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+            export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes"
+          else
+            echo "::error::no push credential: set MIRROR_PUSH_TOKEN (fine-grained PAT, Contents read/write on $REPO) or MIRROR_KEY_${{ matrix.key }} (deploy key)"
             exit 1
           fi
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror_key
-          chmod 600 ~/.ssh/mirror_key
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes"
           source=$(head -c 9 specs/SOURCE 2>/dev/null || echo unknown)
           cd work/$LANG_ID
           git init -q -b main
@@ -197,18 +211,18 @@ jobs:
             commit -q -m "crossly-$LANG_ID SDK" -m "Generated from the Crossly OpenAPI specs at $source by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           # Skip when the mirror already holds exactly this tree.
           target=HEAD
-          if git fetch -q --depth 1 "git@github.com:$REPO.git" main 2>/dev/null \
+          if git fetch -q --depth 1 "$remote" main 2>/dev/null \
              && [ "$(git rev-parse FETCH_HEAD^{tree})" = "$(git rev-parse HEAD^{tree})" ]; then
             echo "$REPO already up to date"
             target=FETCH_HEAD
           else
             # One squashed snapshot, force-pushed: the mirror is a snapshot, not a log.
-            git push -q --force "git@github.com:$REPO.git" main:main
+            git push -q --force "$remote" main:main
             echo "pushed $REPO"
           fi
           if [ -n "$TAG" ]; then
             git -c user.name=crossly-sync -c user.email=noreply@crossly.net tag -a "$TAG" -m "$TAG (specs $source)" "$target"
-            git push -q --force "git@github.com:$REPO.git" "refs/tags/$TAG"
+            git push -q --force "$remote" "refs/tags/$TAG"
             echo "tagged $REPO $TAG"
           fi
-          rm -f ~/.ssh/mirror_key
+          rm -f ~/.ssh/mirror_key; git config --global --unset-all "http.https://github.com/.extraheader" || true

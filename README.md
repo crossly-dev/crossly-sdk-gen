@@ -38,9 +38,13 @@ language to its mirror as one squashed commit:
 | java | [crossly-java](https://github.com/crossly-dev/crossly-java) | elixir | [crossly-elixir](https://github.com/crossly-dev/crossly-elixir) |
 | csharp | [crossly-csharp](https://github.com/crossly-dev/crossly-csharp) | rust | [crossly-rust](https://github.com/crossly-dev/crossly-rust) |
 
-Each push uses a per-mirror deploy key (secret `MIRROR_KEY_<LANG>`, e.g.
-`MIRROR_KEY_TYPESCRIPT_FETCH`) with write access to that one repo. A manual run
-can pass `tag` to tag every mirror commit, and `publish: false` to check only.
+The push authenticates with the repo secret `MIRROR_PUSH_TOKEN`: a fine-grained
+personal access token, resource owner `crossly-dev`, access to only the 12 mirror
+repos above, repository permission **Contents: Read and write** (nothing else).
+Alternatively, per-mirror deploy keys (`MIRROR_KEY_<LANG>`, e.g.
+`MIRROR_KEY_TYPESCRIPT_FETCH`) once deploy keys are enabled for the organization.
+A manual run can pass `tag` to tag every mirror commit, and `publish: false` to
+check only.
 
 ## Contributing
 

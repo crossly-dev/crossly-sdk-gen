@@ -40,6 +40,9 @@ PY
     ;;
   ruby)
     bundle config set --local path vendor/bundle
+    # Runtime deps only: the template's dev group (rubocop → jaro_winkler) has a C
+    # extension that no longer builds on gcc 15, and a consumer never installs it.
+    bundle config set --local without 'development test'
     bundle install --quiet
     gem=$(ls *.gemspec | head -1 | sed 's/\.gemspec$//')
     bundle exec ruby -Ilib -e "require '$gem'; puts 'required ok'"
