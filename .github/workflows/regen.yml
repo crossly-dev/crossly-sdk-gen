@@ -1,0 +1,214 @@
+# Generate every Crossly SDK from specs/, compile each with its own toolchain,
+# and — only when every leg is green, only on main — push each language to its
+# public mirror crossly-dev/crossly-<lang>.
+#
+# The source of this file is tools/sdk-gen/ in the private Crossly monorepo;
+# `pnpm sdk:publish-specs` there copies it here together with the specs.
+name: regen
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'specs/**'
+      - 'scripts/**'
+      - 'integrations/**'
+      - 'ci/**'
+      - '.github/workflows/regen.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push green output to the mirrors (main only)'
+        type: boolean
+        default: true
+      tag:
+        description: 'Optional tag to put on every mirror commit (e.g. v0.2.0)'
+        type: string
+        default: ''
+
+# A newer spec supersedes an older run; never two mirror pushes at once.
+concurrency:
+  group: regen
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CROSSLY_SPEC_DIR: specs
+  # Every compile check so far was made against 5.4.0 output (runs on Java 8).
+  OPENAPI_GENERATOR_VERSION: '5.4.0'
+
+jobs:
+  sdk:
+    name: ${{ matrix.lang }} / ${{ matrix.api }}
+    runs-on: ${{ matrix.lang == 'swift' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [python, php, go, ruby, java, csharp, rust, kotlin, swift, dart, typescript-fetch, elixir]
+        api: [seller, buyer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Generator runtime. Zulu, because Temurin has no Java 8 for Apple silicon.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '8'
+
+      - uses: actions/cache@v4
+        with:
+          path: .tools
+          key: openapi-generator-${{ env.OPENAPI_GENERATOR_VERSION }}
+
+      # generate-sdks runs `go mod tidy` as a post-step for Go.
+      - if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: generate
+        run: node scripts/generate-sdks.mjs --lang ${{ matrix.lang }} --api ${{ matrix.api }}
+
+      # Packed BEFORE the compile check, so no build output (lockfiles, target/,
+      # vendor/, bin/obj) can leak into a mirror. Uploaded only if the check passes.
+      - name: pack
+        run: |
+          extra=""
+          if [ "${{ matrix.api }}" = seller ] && [ -d sdks/${{ matrix.lang }}/webhooks ]; then extra=webhooks; fi
+          tar -czf sdk-${{ matrix.lang }}-${{ matrix.api }}.tgz -C sdks/${{ matrix.lang }} ${{ matrix.api }} $extra
+
+      # ── per-language toolchains ─────────────────────────────────────
+      - if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - if: matrix.lang == 'php'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+      - if: matrix.lang == 'ruby'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - if: matrix.lang == 'java' || matrix.lang == 'kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+      - if: matrix.lang == 'csharp'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - if: matrix.lang == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+      - if: matrix.lang == 'dart'
+        uses: dart-lang/setup-dart@v1
+        with:
+          # The 5.4.0 template's pubspec says sdk <3.0.0.
+          sdk: '2.19.6'
+      - if: matrix.lang == 'elixir'
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '25'
+          elixir-version: '1.14'
+
+      - name: compile check
+        run: bash ci/check.sh ${{ matrix.lang }} sdks/${{ matrix.lang }}/${{ matrix.api }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-${{ matrix.lang }}-${{ matrix.api }}
+          path: sdk-${{ matrix.lang }}-${{ matrix.api }}.tgz
+          retention-days: 14
+
+  publish:
+    name: publish ${{ matrix.lang }}
+    needs: sdk
+    # Only when every leg above is green (needs), only from main, never from a fork.
+    if: github.ref == 'refs/heads/main' && github.repository == 'crossly-dev/crossly-sdk-gen' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - { lang: python, key: PYTHON }
+          - { lang: php, key: PHP }
+          - { lang: go, key: GO }
+          - { lang: ruby, key: RUBY }
+          - { lang: java, key: JAVA }
+          - { lang: csharp, key: CSHARP }
+          - { lang: rust, key: RUST }
+          - { lang: kotlin, key: KOTLIN }
+          - { lang: swift, key: SWIFT }
+          - { lang: dart, key: DART }
+          - { lang: typescript-fetch, key: TYPESCRIPT_FETCH }
+          - { lang: elixir, key: ELIXIR }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-${{ matrix.lang }}-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: assemble + scan
+        run: |
+          mkdir -p work/${{ matrix.lang }}
+          for f in artifacts/*.tgz; do tar -xzf "$f" -C work/${{ matrix.lang }}; done
+          node ci/assemble-mirror.mjs ${{ matrix.lang }} work/${{ matrix.lang }}
+
+      - name: push to crossly-dev/crossly-${{ matrix.lang }}
+        env:
+          DEPLOY_KEY: ${{ secrets[format('MIRROR_KEY_{0}', matrix.key)] }}
+          TAG: ${{ inputs.tag }}
+          REPO: crossly-dev/crossly-${{ matrix.lang }}
+          LANG_ID: ${{ matrix.lang }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::secret MIRROR_KEY_${{ matrix.key }} is not set (deploy key with write access to $REPO)"
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes"
+          source=$(head -c 9 specs/SOURCE 2>/dev/null || echo unknown)
+          cd work/$LANG_ID
+          git init -q -b main
+          git add -A
+          git -c user.name=crossly-sync -c user.email=noreply@crossly.net \
+            commit -q -m "crossly-$LANG_ID SDK" -m "Generated from the Crossly OpenAPI specs at $source by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Skip when the mirror already holds exactly this tree.
+          target=HEAD
+          if git fetch -q --depth 1 "git@github.com:$REPO.git" main 2>/dev/null \
+             && [ "$(git rev-parse FETCH_HEAD^{tree})" = "$(git rev-parse HEAD^{tree})" ]; then
+            echo "$REPO already up to date"
+            target=FETCH_HEAD
+          else
+            # One squashed snapshot, force-pushed: the mirror is a snapshot, not a log.
+            git push -q --force "git@github.com:$REPO.git" main:main
+            echo "pushed $REPO"
+          fi
+          if [ -n "$TAG" ]; then
+            git -c user.name=crossly-sync -c user.email=noreply@crossly.net tag -a "$TAG" -m "$TAG (specs $source)" "$target"
+            git push -q --force "git@github.com:$REPO.git" "refs/tags/$TAG"
+            echo "tagged $REPO $TAG"
+          fi
+          rm -f ~/.ssh/mirror_key
