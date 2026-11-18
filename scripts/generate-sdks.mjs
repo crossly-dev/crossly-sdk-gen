@@ -250,6 +250,39 @@ function castDartFreeFormLists(dir) {
   return changed;
 }
 
+/**
+ * The 5.4.0 typescript-fetch generator names an operation's parameter
+ * interface `<OpId>Request`. When a model already has that name (the request
+ * body of `updateSourceSyncLocation` is `UpdateSourceSyncLocationRequest`) it
+ * renames the interface — and the inline enums of that operation's
+ * parameters — to `<OpId>Operation…`, but the interface's field still names
+ * the enum by the OLD name, so `tsc` stops at "Cannot find name
+ * 'UpdateSourceSyncLocationPlatformEnum'". Only an operation with both the
+ * collision and an inline enum parameter hits it. The renamed enum is given
+ * back the name every reference uses; anything else is left alone.
+ */
+function fixTsCollidedParamEnums(dir) {
+  const apis = join(dir, 'src', 'apis');
+  if (!existsSync(apis)) return 0;
+  let changed = 0;
+  for (const name of readdirSync(apis).filter((f) => f.endsWith('.ts'))) {
+    const file = join(apis, name);
+    const before = readFileSync(file, 'utf8');
+    let text = before;
+    const defined = new Set([...text.matchAll(/^export enum (\w+)/gm)].map((m) => m[1]));
+    const used = new Set([...text.matchAll(/:\s*(\w+Enum)\b/g)].map((m) => m[1]));
+    for (const def of defined) {
+      const m = def.match(/^(\w+)Operation(\w+Enum)$/);
+      const want = m && `${m[1]}${m[2]}`;
+      if (!want || defined.has(want) || !used.has(want)) continue;
+      text = text.replace(new RegExp(`\\b${def}\\b`, 'g'), want);
+      changed += 1;
+    }
+    if (text !== before) writeFileSync(file, text);
+  }
+  return changed;
+}
+
 /** `crossly` / `crossly_buyer` — see `sdkPackageName` in sdk-layout.mjs. */
 const packageName = (lang, api) => sdkPackageName(lang.id, api.id);
 
@@ -360,6 +393,7 @@ for (const { api, lang } of jobs) {
     shardModels(lang.id, out, areasFor(api));
     if (lang.id === 'go') tidyGoModule(out);
     if (lang.id === 'dart') castDartFreeFormLists(out);
+    if (lang.id === 'typescript-fetch') fixTsCollidedParamEnums(out);
     const reduced = tidyGeneratedDocs(out, whereThingsAre(lang.id, api.id, packageName(lang, api)));
     results.push({ label, ok: true });
     console.log(`ok${reduced ? `  (${reduced} links to dropped model pages reduced to text)` : ''}`);
